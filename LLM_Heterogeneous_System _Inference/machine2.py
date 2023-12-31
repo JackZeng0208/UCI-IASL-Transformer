@@ -7,11 +7,11 @@ from transformers import AutoModelForCausalLM
 
 def init_process():
     os.environ['MASTER_ADDR'] = '128.195.55.253'  # Replace with the actual IP of Machine 1
-    os.environ['MASTER_PORT'] = '12345'        # The same port as used on Machine 1
+    os.environ['MASTER_PORT'] = '8233'        # The same port as used on Machine 1
     dist.init_process_group(backend='nccl', rank=1, world_size=2)
 
 def load_and_partition_model():
-    model = model = AutoModelForCausalLM.from_pretrained("microsoft/phi-2", torch_dtype="auto", device_map="cuda", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained("microsoft/phi-2", torch_dtype="auto", device_map="cuda", trust_remote_code=True)
     num_layers = len(model.transformer.h)
     model.transformer.h = model.transformer.h[num_layers // 2:]  # Keep the second half of the layers
     return model.to('cuda')
