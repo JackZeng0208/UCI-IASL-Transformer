@@ -1,0 +1,2 @@
+# ingore byte code is compiled by interpreter
+*.pyc
