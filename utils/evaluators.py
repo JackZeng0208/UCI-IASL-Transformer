@@ -1,6 +1,6 @@
 # code of evluators for both inference and speculative decoding
 
-import GPUtil
+# import GPUtil
 import time
 from typing import Optional, List, Tuple
 import torch
@@ -28,6 +28,7 @@ class InferenceEvaluator():
         task: str,
         prompt: str,
         compile: bool = False,
+        # TODO: add generation function to allow customization in sampling and decode methods
     ) -> Tuple[str, float, float, float]:
         assert (task == "time" or task == "memory")
         model = self._model
@@ -40,7 +41,7 @@ class InferenceEvaluator():
                 model, mode="reduce-overhead", fullgraph=True)
 
         # TODO: add memory checking
-        GPUs = GPUtil.getGPUs()
+        # GPUs = GPUtil.getGPUs()
         inference_history = {}
         gpu_usage = []
         model.eval()
@@ -49,7 +50,11 @@ class InferenceEvaluator():
             print(f"Prompt: {prompt}")
             start_time = time.time()
             outputs = model.generate(
-                outputs, max_new_tokens=1, do_sample=False)
+                outputs, 
+                max_new_tokens=1, 
+                do_sample=True,
+                top_p=0.95,
+            )
             time_to_first_token = time.time() - start_time
             token_count += 1
 
@@ -57,7 +62,11 @@ class InferenceEvaluator():
             for _ in range(2, self.max_seq_length + 1):
                 start_time = time.time()
                 outputs = model.generate(
-                    outputs, max_new_tokens=1, do_sample=False)
+                    outputs, 
+                    max_new_tokens=1, 
+                    do_sample=True,
+                    top_p=0.95,
+                )
                 token_count += 1
                 next_token = outputs[0][-1]
                 time_taken = time.time() - start_time
@@ -70,8 +79,7 @@ class InferenceEvaluator():
             latency = time_to_first_token + total_time
             time_per_output_token = total_time / outputs.shape[1]
             # decode the generated token ids to text
-            generated_text = self._tokenizer.decode(
-                outputs[0][input_ids.shape[1] + 1:])
+            generated_text = self._tokenizer.decode(outputs[0][input_ids.shape[1] + 1:])
             inference_history["TTFT"] = time_to_first_token
             inference_history["TPOT"] = time_per_output_token
             inference_history["Latency"] = latency
