@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import torch
@@ -15,7 +16,7 @@ from utils.evaluators import InferenceEvaluator
 
 
 def main(
-    # tasks: List[str],
+    # tasks: List[str],      evaluate tasks where user could specify token generation time, memory usage
     prompt: str,
     speculate_k: int,
     ip: str,

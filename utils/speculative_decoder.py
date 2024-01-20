@@ -23,7 +23,7 @@ class SpeculativeDecoder:
         )
         print(response)
         if response.status_code == 200:
-            return response.json().get("target_output")
+            return response.json().get("target_outputs")
         else:
             response.raise_for_status()
             return []

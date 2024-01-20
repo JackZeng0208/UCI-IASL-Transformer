@@ -1,6 +1,6 @@
-from typing import List, Tuple, Optional
-import requests
 import torch
+import numpy as np
+from typing import List, Tuple, Optional
 import torch.nn.functional as F
 from orin.config import OPTConfig
 from utils.speculative_decoder import SpeculativeDecoder
@@ -14,13 +14,19 @@ def multinomial_sample_one_no_sync(probs_sort):
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     # top_k: default set to 50, refer to top k sampling
-    logits = logits / max(temperature, 1e-5)
+    # FIXME: this part is directly from gpt-fast, need actual implementation with various ways of sampling
+    #   important sampling, trunction sampling (temperature used to add creativity into output but not necessary 
+    #   for validation)
+    # logits = torch.Tensor(logits)
+    # logits = logits.view(1, logits.shape[-1]) / max(temperature, 1e-5)
+    logits = torch.Tensor(logits) / max(temperature, 1e-5)
+    print(f"logits shape: {logits.shape}")
 
     if top_k is not None:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         pivot = v.select(-1, -1).unsqueeze(-1)
         logits = torch.where(logits < pivot, -float("Inf"), logits)
-    probs = torch.nn.functional.softmax(logits, dim=-1)
+    probs = F.softmax(logits, dim=-1)
     return probs
 
 @torch.no_grad()
@@ -71,10 +77,11 @@ def speculative_decoding(
     if target_outputs == []:
         return torch.Tensor([])
     
-    target_probs = logits_to_probs(target_outputs["scores"][0], top_k=top_k)
+    target_probs = logits_to_probs(target_outputs["scores"], top_k=top_k)
     target_tokens = target_outputs["sequences"]
     draft_probs = torch.stack(draft_probs)
     # p: draft prob, q: target prob
+    # FIXME: the shape of draft_probs is wrong...
     p = draft_probs[torch.arange(0, speculate_k, device=OPTConfig.device), draft_tokens]
     q = target_probs[torch.arange(0, speculate_k, device=OPTConfig.device), draft_tokens]
 
