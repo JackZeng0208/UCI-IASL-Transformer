@@ -22,8 +22,9 @@ def main(
     max_seq_length: Optional[int] = 100
 ):
     model, tokenizer, config = build_opt_model(model_size=model_size)
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
-    output_tokens = speculative_decoding(model, input_ids, speculative_k=5)
+    print(model.transformer.h)
+    # input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    # output_tokens = speculative_decoding(model, input_ids, speculative_k=5)
 
     # generated_text = generate(
     #     model,

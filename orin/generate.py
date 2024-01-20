@@ -1,5 +1,5 @@
 from typing import List, Tuple, Optional
-
+import requests
 import torch
 import torch.nn.functional as F
 from orin.config import OPTConfig
@@ -50,14 +50,16 @@ def speculative_decoding(
 
     # validate draft model outputs by feeding draft tokens with inputs into target model 
     # and compare the prediction on the next token
-    target_outputs = dict(model.generate(
-        torch.cat([input_ids.clone().to(OPTConfig.device), draft_tokens]),
-        max_new_tokens=1,
-        do_sample=False,
-        return_dict_in_generate=True,
-        output_scores=True,
-        output_attentions=True,
-    ))
+    # target_outputs = dict(model.generate(
+    #     torch.cat([input_ids.clone().to(OPTConfig.device), draft_tokens]),
+    #     max_new_tokens=1,
+    #     do_sample=False,
+    #     return_dict_in_generate=True,
+    #     output_scores=True,
+    #     output_attentions=True,
+    # ))
+    
+    # requests.post()
 
     target_probs = logits_to_probs(target_outputs["scores"][0], top_k=top_k)
     target_tokens = target_outputs["sequences"]
