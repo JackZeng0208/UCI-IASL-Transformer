@@ -3,6 +3,7 @@ import requests
 import torch
 import torch.nn.functional as F
 from orin.config import OPTConfig
+from utils.speculative_decoder import SpeculativeDecoder
 from transformers import PreTrainedModel, PreTrainedTokenizer, OPTForCausalLM
 
 
@@ -11,9 +12,8 @@ def multinomial_sample_one_no_sync(probs_sort):
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
-
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    # top_k: default set to 200, refer to top k sampling
+    # top_k: default set to 50, refer to top k sampling
     logits = logits / max(temperature, 1e-5)
 
     if top_k is not None:
@@ -23,30 +23,36 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
 
-
 @torch.no_grad()
 def speculative_decoding(
     draft_model: PreTrainedModel,
-    model: PreTrainedModel,
+    # model: PreTrainedModel,
     input_ids: torch.Tensor,
-    speculative_k: int,
+    ip: str,
+    port: int,
+    speculate_k: int,
+    top_p: float,
     top_k: Optional[int] = None,
 ) -> torch.Tensor:
-    draft_tokens, draft_probs = [0 for _ in range(speculative_k)], [0.0 for _ in range(speculative_k)]
+    draft_tokens, draft_probs = [0 for _ in range(speculate_k)], [0.0 for _ in range(speculate_k)]
     draft_model.to(OPTConfig.device)
-    draft_outputs = input_ids.clone().to(OPTConfig.device)
-    for i in range(speculative_k):
+    draft_sequences = input_ids.clone().to(OPTConfig.device)
+    # print(f"init shape: {draft_sequences.shape}")
+    for i in range(speculate_k):
         draft_outputs = dict(draft_model.generate(
-            draft_outputs,
+            draft_sequences,
             max_new_tokens=1,
-            do_sample=False,
+            do_sample=True,
+            top_p=top_p,
+            top_k=top_k,
             return_dict_in_generate=True,
             output_scores=True,
         ))
-        sequences = draft_outputs["sequences"]
+        draft_sequences = draft_outputs["sequences"]
+        # print(f"later shape: {draft_sequences.shape}")
         scores = draft_outputs["scores"][0]
         draft_probs[i] = logits_to_probs(scores, top_k=top_k)
-        draft_tokens[i] = sequences[0][-1]
+        draft_tokens[i] = draft_sequences[0][-1]
 
     # validate draft model outputs by feeding draft tokens with inputs into target model 
     # and compare the prediction on the next token
@@ -58,18 +64,22 @@ def speculative_decoding(
     #     output_scores=True,
     #     output_attentions=True,
     # ))
-    
-    # requests.post()
 
+    # speculative decoding but remotely
+    decoder = SpeculativeDecoder(server_ip=ip, port=port)
+    target_outputs = decoder.get_target_output(input_ids=input_ids, draft_tokens=draft_tokens, top_p=top_p, top_k=top_k)
+    if target_outputs == []:
+        return torch.Tensor([])
+    
     target_probs = logits_to_probs(target_outputs["scores"][0], top_k=top_k)
     target_tokens = target_outputs["sequences"]
     draft_probs = torch.stack(draft_probs)
     # p: draft prob, q: target prob
-    p = draft_probs[torch.arange(0, speculative_k, device=OPTConfig.device), draft_tokens]
-    q = target_probs[torch.arange(0, speculative_k, device=OPTConfig.device), draft_tokens]
+    p = draft_probs[torch.arange(0, speculate_k, device=OPTConfig.device), draft_tokens]
+    q = target_probs[torch.arange(0, speculate_k, device=OPTConfig.device), draft_tokens]
 
     # get probs for each speculate token
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculative_k] / p)
+    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k] / p)
     # determine whether to accept each speculate token based on its accept prob
     rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
 
@@ -88,7 +98,6 @@ def speculative_decoding(
         next_token = multinomial_sample_one_no_sync(new)
         return torch.cat([draft_tokens[:accept_length], next_token])
 
-
 @torch.no_grad()
 def generate(
     model: PreTrainedModel,
@@ -100,7 +109,13 @@ def generate(
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     outputs = input_ids.to(OPTConfig.device)
     for _ in range(max_new_tokens):
-        outputs = model.generate(outputs, max_new_tokens=1, do_sample=False)
+        outputs = model.generate(
+            outputs, 
+            max_new_tokens=1, 
+            do_sample=True,      # enable advanced sampling strategies
+            top_p=0.95,
+            num_return_sequences=1
+        )
         next_token = outputs[0][-1]
         # if generated token is end of sentence token, stop the inference
         if next_token.item() == tokenizer.eos_token_id:
