@@ -1,5 +1,4 @@
 # Imports
-# Note: This is orin's code
 import torch
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -7,36 +6,31 @@ import os
 
 # Initialize the distributed environment
 def init_process():
-    os.environ['MASTER_ADDR'] = '128.195.55.253'  # IP of Machine 1
+    os.environ['MASTER_ADDR'] = '66.42.104.193'  # IP of Machine 1
     os.environ['MASTER_PORT'] = '8233'        # A chosen port
-    dist.init_process_group(backend='gloo', rank=0, world_size=2) # Since it's an orin rather than GPU from PCIE
+    dist.init_process_group(backend='nccl', rank=0, world_size=2)
 
-# Load and partition the model
-def load_and_partition_model():
-    model = AutoModelForCausalLM.from_pretrained("microsoft/phi-2", torch_dtype="auto", device_map="cuda", trust_remote_code=True)
-    num_layers = len(model.transformer.h)
-    model.transformer.h = model.transformer.h[:num_layers // 2]
-    return model.to('cuda:0')
+def load_model_and_tokenizer(model_name):
+    model = AutoModelForCausalLM.from_pretrained(model_name).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    first_half = torch.nn.Sequential(*list(model.children())[:len(list(model.children())) // 2])
+    return first_half, tokenizer
 
-# Prepare input data
-def prepare_input():
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2")
-    inputs = tokenizer('''def print_prime(n):
-   """
-   Print all primes between 1 and n
-   """''', return_tensors="pt").input_ids
-    return inputs.to('cuda:0')
+def process_input(tokenizer, text):
+    inputs = tokenizer(text, return_tensors='pt')
+    return inputs['input_ids'].cuda()
 
-# Main function
 def main():
     init_process()
-    model = load_and_partition_model()
-    input_ids = prepare_input()
+    model_name = "gpt2"  # Replace with your model
+    model, tokenizer = load_model_and_tokenizer(model_name)
 
-    with torch.no_grad():
-        outputs = model(input_ids)
+    input_text = "introduce yourself"
+    input_ids = process_input(tokenizer, input_text)
 
-    # Send outputs to Machine 2
+    outputs = model(input_ids)
+    print(outputs.shape)
+    # Send output to Machine 2
     dist.send(tensor=outputs, dst=1)
 
 if __name__ == "__main__":

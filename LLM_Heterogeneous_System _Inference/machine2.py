@@ -1,34 +1,41 @@
-# Machine 2: Responsible for receiving data from Machine 1, processing it, and optionally sending it back
-
+# Imports
 import torch
 import torch.distributed as dist
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
-from transformers import AutoModelForCausalLM
 
+# Initialize the distributed environment
 def init_process():
-    os.environ['MASTER_ADDR'] = '128.195.55.253'  # Replace with the actual IP of Machine 1
-    os.environ['MASTER_PORT'] = '8233'        # The same port as used on Machine 1
+    os.environ['MASTER_ADDR'] = '128.195.55.253'  # IP of Machine 1
+    os.environ['MASTER_PORT'] = '8233'        # A chosen port
     dist.init_process_group(backend='nccl', rank=1, world_size=2)
 
-def load_and_partition_model():
-    model = AutoModelForCausalLM.from_pretrained("microsoft/phi-2", torch_dtype="auto", device_map="cuda", trust_remote_code=True)
-    num_layers = len(model.transformer.h)
-    model.transformer.h = model.transformer.h[num_layers // 2:]  # Keep the second half of the layers
-    return model.to('cuda')
+def load_model_and_tokenizer(model_name):
+    model = AutoModelForCausalLM.from_pretrained(model_name).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    second_half = torch.nn.Sequential(*list(model.children())[len(list(model.children())) // 2:])
+    return second_half, tokenizer
+
+def decode_output(tokenizer, outputs):
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 def main():
     init_process()
-    model = load_and_partition_model()
+    model_name = "microsoft/phi-2"  # Replace with your model
+    model, tokenizer = load_model_and_tokenizer(model_name)
 
-    # Receive input from Machine 1
-    received_tensor_size = (1, 512, 768)
-    received_tensor = torch.empty(received_tensor_size, dtype=torch.long, device='cuda')
+    # The tensor size here should match the output size of the first half of the model on Machine 1
+    received_tensor = torch.empty(1, 512, dtype=torch.long).cuda()  # Adjust the size accordingly
+
+    # Receive output from Machine 1
     dist.recv(tensor=received_tensor, src=0)
 
-    with torch.no_grad():
-        outputs = model(received_tensor)
-
-    # Further processing of outputs can be done here
+    # Run the second half of the model
+    outputs = model(received_tensor)
+    
+    # Decode the output to text
+    generated_text = decode_output(tokenizer, outputs)
+    print(generated_text)
 
 if __name__ == "__main__":
     main()
