@@ -24,9 +24,11 @@ def init_processes(rank, size,IP, Port ,backend='nccl'):
     """ Initialize the distributed environment. """    
     print('{} : started process for rank : {}'.format(os.getpid(),rank))
 	
+    os.environ['MASTER_ADDR'] = "66.42.104.193"
+    os.environ['MASTER_PORT'] = '6100'
 	#Remove init_method if initializing through environment variable
     dist.init_process_group(backend = backend, 
-                            init_method=f'tcp://{IP}:{Port}',
+                            # init_method=f'tcp://{IP}:{Port}',
                             rank=rank,
                             world_size=size,
                             timeout=datetime.timedelta(0,seconds =  20))
@@ -34,5 +36,7 @@ def init_processes(rank, size,IP, Port ,backend='nccl'):
 
 
 if __name__ == "__main__":
-    init_processes(0,2,'66.42.104.193','8233')
+    print(dist.is_available)
+    init_processes(0,2,'66.42.104.193','6100')
+    # init_processes(1,2,'192.168.0.44','1234')
     double_send(rank=0)
