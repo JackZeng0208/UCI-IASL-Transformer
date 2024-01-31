@@ -14,3 +14,6 @@ There are three folders: orin, server, nano. Each of them contains the code and 
 
 **Models**
 1. OPT
+
+**Kaggle Notebook:**
+* homogeneous two gpus speculative decoding notebook: https://www.kaggle.com/code/langzhelu/speculative-decoding-homogeneous
