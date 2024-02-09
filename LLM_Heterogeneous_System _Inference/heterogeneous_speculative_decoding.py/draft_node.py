@@ -1,165 +1,153 @@
+
+# from torch.multiprocessing import Process
+from  time import sleep
+import datetime
 import torch
-import torch.distributed as dist
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import os
-import socket
 
-"""
-1. first test if double send and recv is working 
-2. then test wither the while loop will also work
-"""
 
-print(torch.distributed.is_available())
-print(torch.cuda.is_available())
-print(torch.distributed.is_nccl_available())
-print(socket.gethostname())
-
+import requests
+import torch
+import time
+from utilis import KVCacheModel, sample, max_fn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-def get_distribution(logits, temperature):
-    probs = torch.softmax(logits / (temperature + 1e-10), dim=-1)
-#     print(f'probs return by get_distribution is {probs} shape is {probs.shape}')
-    return probs
+def edge_speculative_sampling(prefix : torch.Tensor, 
+                         approx_model : torch.nn.Module, 
+                         SERVER_IP: str,
+                         max_len : int , gamma : int = 4,
+                         temperature : float = 1, top_k : int = 0, top_p : float = 0, 
+                         verbose : bool = False, random_seed : int = None) -> torch.Tensor:
+    """
+    the edge speculative sample will handle
+    1. place prefix to device
+    2. place model to device
+    """
+    seq_len = prefix.shape[1]
+    ## number of total token should generate
+    T = seq_len+max_len
+    approx_model_cache = KVCacheModel(approx_model, temperature, top_k, top_p).to('cuda:0')
 
-def sample(logits, temperature):
-    probs = get_distribution(logits, temperature)
-    return torch.multinomial(probs, num_samples=1)[0]
+    #### stats collection ########
+    resample_count = 0
+    target_sample_count = 0
+    accepted_count = 0
+    prefix = prefix.to('cuda:0')
+    start_time = time.time()
+    #### stats collection ########
 
-def sample_from_draft_model(
-    model, 
-    prefix, 
-    gamma, 
-    temperature=1.0
-):
-    # output_token = prefix.detach().clone()
-    output_token = prefix
-    out_logits = []
-    
-    for _ in range(gamma):
-        sample_token_logits = model(output_token).logits[:, -1, :]
-        sample_token = sample(sample_token_logits, temperature=temperature)
-        # what is sample_token[None,...]??
-        # print(f'what is sample_token[None,...]: {sample_token[None,...]}')
-        # print(f'sample_token is {sample_token}')
-        output_token = torch.concat([output_token, sample_token[None,...]], dim=-1)
-        out_logits.append(sample_token_logits)
-
-    out_logits = torch.stack(out_logits, dim=1)
-#     print(f'output logit from draft m is {output_token} with shape of {output_token.shape}')
-    return output_token, out_logits
-            
-            
-    
-
-def init_process():
-    os.environ['MASTER_ADDR'] = '169.234.62.234'  # IP of 3060
-    os.environ['MASTER_PORT'] = '8233'        # A chosen port
-    dist.init_process_group(backend='nccl', rank=1, world_size=2)
-
-def run_draft_model(
-        draft_model,
-        gamma,
-        prefix,
-        max_len =10,
-):
-    init_process()
-    output_len = prefix.shape[-1]
-    output = prefix # detech from device? 
-    output = output.cuda()
-    # while output_len < max_len:
+    ## prefix = shape (1,prefix.len)
+    while prefix.shape[1] < T: 
+        # update prefix len, it will update during each iteration
+        prefix_len = prefix.shape[1]
+        draft_tokens = approx_model_cache.generate(prefix, gamma)
+        draft_tokens_to_server = draft_tokens.to('cpu')
+        # draft_token_shape = list(draft_tokens.size())
+        draft_token_list = draft_tokens_to_server.tolist()
+        send_tensor_to_server(SERVER_IP=SERVER_IP,tensor_list=draft_token_list)
+        received_tensor = get_tensor(SERVER_IP=SERVER_IP)
+        #############
+        # how to wait until I get new tensor? 
+        # I json error from get_tensor
+        #############
+        while received_tensor is None: 
+            received_tensor = get_tensor(SERVER_IP=SERVER_IP)
         
-    orig_output_len = output_len
-    N = output.shape[-1]
-#         print(f'check device draft model: {draft_model.device}, output: {output.device}')
-    draft_outputs, draft_logits = sample_from_draft_model(draft_model,output,gamma)
-    d1, d2 = draft_outputs.shape
-    dist.send(tensor=torch.tensor((d1,d2)),dst=0)
-    dist.send(tensor=draft_outputs,dst=0)
-
-    # target logit shape is [1, gamma +1, world embedding dim]
-    target_logit_shape = torch.empty((3),dtype=torch.long)
-    dist.recv(tensor=target_logit_shape,src =0)
-    print(f'darft side: what is the target logit shape {target_logit_shape}')
-    d1, d2, d3 = target_logit_shape.shape
-    target_logit = torch.empty((d1, d2, d3),dtype=torch.float32)
-    dist.recv(tensor=target_logit,src=0)
-    print(f'darft side: what is the target logit {target_logit}')
-
-
-
-
-def heterogeneous_speculative_sampling(
-    target_model,
-    draft_model,
-    prefix,
-    max_len,
-    tokenizer,
-    gamma = 4,
-    temperature = 1,
-    debug = False
-):
-    output_len = prefix.shape[-1]
-    output = prefix # detech from device? 
-    output = output.to('cuda:1')
-    while output_len < max_len:
+        target_model_history = received_tensor
+        target_model_history = target_model_history.to('cuda:0')
+        n = prefix_len + gamma - 1
         
-        orig_output_len = output_len
-        N = output.shape[-1]
-#         print(f'check device draft model: {draft_model.device}, output: {output.device}')
-        draft_outputs, draft_logits = sample_from_draft_model(draft_model,output,gamma)
-        
-        ##########################
-        draft_outputs = draft_outputs.detach().to('cuda:0')
-        # server cuda:0 only do one calculation and send the logit back to edge cuda:1
-        target_logits = target_model(draft_outputs).logits[:,-gamma-1:,:]
-        draft_outputs = draft_outputs.detach().to('cuda:1')
-        target_logits = target_logits.detach().to('cuda:1')
-        ###########################
-        
-        # result of the calculation should perform on cuda 1
-        
-        target_model_distribution = get_distribution(target_logits, temperature)
-        draft_model_distribution = get_distribution(draft_logits, temperature)
-#         print(f'check on cpu or gpu: target_model_distribution {target_model_distribution.device} , draft_model_distribution { draft_model_distribution.device}')
-        if debug: 
-            print(f"Possible continuations: {tokenizer.decode(draft_outputs[0,orig_output_len:], skip_special_tokens=True)}")
-        accepted_flag = 1
+
         for i in range(gamma):
-            numerator = target_model_distribution[:, i, draft_outputs[0, N+i]]
-            denominator = draft_model_distribution[:, i, draft_outputs[0, N+i]]
-            r = (numerator/denominator)
-            uniform_distribution = torch.rand_like(numerator)
-            ones_tensor = torch.ones_like(numerator)
-            if (uniform_distribution < torch.min(ones_tensor,r)).any():
-#                 print(f'check on cpu or gpu: draft_outputs {draft_outputs.device}, output { output.device}')
-                output = torch.concat([output, draft_outputs[:, N+i].unsqueeze(dim=-1)], dim=-1)
-                output_len += 1
-            else:
-                new_dist = (target_model_distribution[:, i, :] - draft_model_distribution[:, i, :])
-                new_dist = torch.max(torch.zeros_like(new_dist), new_dist)
-                new_dist = new_dist / new_dist.sum(dim=-1, keepdim=True)
-                token_id = torch.multinomial(new_dist, num_samples=1)[0]
-                output = torch.concat([output, token_id[None,...]], dim=-1)
-                if debug:
-                    print(f'correction is {tokenizer.decode(output[0,orig_output_len:], skip_special_tokens=True)}')
-                accepted_flag = 0
+            if random_seed:
+                torch.manual_seed(random_seed)
+            r = torch.rand(1, device = 'cuda:0')
+            j = draft_tokens[:, prefix_len + i]
+            # j = j.to('cpu')
+            
+            if r > (target_model_history[:, prefix_len + i - 1, j]) / (approx_model_cache._prob_history[:, prefix_len + i - 1, j]):
+                # reject
+                n = prefix_len + i - 1
                 break
-        if accepted_flag == 1:
-            sample_token = sample(target_logits[:, -1, :], temperature=temperature)
-            output = torch.concat([output, sample_token[None,...]], dim=-1)
-        if debug:
-            print(f"accepted continuations: {tokenizer.decode(output[0,orig_output_len:], skip_special_tokens=True)}")
-        output_len += 1
-    return output
+            
+            # if verbose:
+            #     print(f"approx guess accepted {j[0]}: \033[31m{AutoTokenizer.decode(torch.tensor([j]))}\033[0m")
 
-if __name__ == "__main__":
-    target_model = "facebook/opt-1.3b"
-    draft_model = "facebook/opt-125m"
+            accepted_count += 1
+        
+        # print(f"n : {n}, i : {i}, prefix_len + gamma - 1: {prefix_len + gamma - 1}")
+        assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
+        prefix = draft_tokens[:, :n + 1]
+        
+        approx_model_cache.rollback(n+1)
+        
+        assert approx_model_cache._prob_history.shape[-2] <= n + 1, f"approx_model prob list shape {approx_model_cache._prob_history.shape}, n {n}"
+        
+        if n < prefix_len + gamma - 1:
+            # reject someone, sample from the pos n
+            t = sample(max_fn(target_model_history[:, n, :] - approx_model_cache._prob_history[:, n, :]))
+            # if verbose:
+            #     print(f"target resamples at position {n}: \033[34m{tokenizer.decode(t)}\033[0m")
+            resample_count += 1
+            update_target_cache(SERVER_IP,n+1)
+            # target_model_cache.rollback(n+1)
+        else:
+            # all approx model decoding accepted
+            assert n == target_model_history.shape[1] - 1
+            t = sample(target_model_history[:, -1, :])
+            # if verbose:
+            #     print(f"target samples {n}: \033[35m{tokenizer.decode(t)}\033[0m")
+            target_sample_count += 1
+            update_target_cache(SERVER_IP,n+2)
+            # target_model_cache.rollback(n+2)
+        prefix = prefix.to("cuda:0")
+#         print(f'prefix device is {prefix.device}, t device is {t.device}')
+        prefix = torch.cat((prefix, t), dim=1)
+
+    if verbose:
+        print(f"generated tokens numbers {prefix.shape[-1] - seq_len}, accepted_count {accepted_count}, target_sample_count {target_sample_count}, resample_count {resample_count}")
+    end_time = time.time()
+    print(f"Token Generation Speed (with speculative decoding): {max_len/(end_time-start_time)} tokens/s")
+    print(f"Acceptance Rate: {accepted_count/max_len}")
+    return prefix
 
 
-    d_model = AutoModelForCausalLM.from_pretrained(draft_model)
-    d_tokenizer = AutoTokenizer.from_pretrained(draft_model)
-    d_model.cuda()
-    d_model.eval()
-    prefix = d_tokenizer('once upon a time',return_tensors = 'pt').input_ids
-    run_draft_model(d_model,4,prefix)
+
+###############################################################################
+# Replace with the actual IP address of the server
+def update_target_cache(SERVER_IP,index):
+    data = {'index': index}
+    response = requests.post(f'http://{SERVER_IP}:6100/update_cache', json=data)
+
+def send_tensor_to_server(SERVER_IP, tensor_list):
+    data = {'tensor_list': tensor_list}
+    response = requests.post(f'http://{SERVER_IP}:6100/send_tensor_to_server', json=data)
+    print('send from edge to server',response.json())
+
+def get_tensor(SERVER_IP):
+    response = requests.get(f'http://{SERVER_IP}:6100/get_tensor_from_server')
+    tensor_data = response.json()['tensor_list']
+    if tensor_data is not None:
+        target_model_cache_history = torch.tensor(tensor_data)
+        print(f'cache_history from target is {target_model_cache_history.shape}')
+        return target_model_cache_history
+    else:
+        return None
+
+if __name__ == '__main__':
+    SERVER_IP = '192.168.0.239'
+    approx_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m", torch_dtype="auto", trust_remote_code=True)
+    approx_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+    input_ids = approx_tokenizer.encode("Please write an introduction about UC Irvine: ", return_tensors='pt')
+    # input_ids = input_ids.to('cuda:1')
+    # inputs = target_tokenizer("Please write an introduction about UC Irvine: ", return_tensors="pt", return_attention_mask=False)
+    top_k = 20
+    top_p = 0.9
+    edge_speculative_sampling(
+        prefix=input_ids,
+        approx_model=approx_model,
+        SERVER_IP= SERVER_IP,
+        max_len=10,
+        gamma=4,
+    )
+  
+

@@ -1,46 +1,83 @@
 import torch
-import torch.distributed as dist
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import os
-import socket
-ip_address = socket.gethostbyname(socket.gethostname())
-print(ip_address)
+import torch.distributed as dist 
+from flask import Flask, request, jsonify
+import torch
+import threading
+from utils import KVCacheModel
 
-def init_process():
-    os.environ['MASTER_ADDR'] = '66.42.104.193'  # IP of 4090
-    os.environ['MASTER_PORT'] = '8233'        # A chosen port
-    dist.init_process_group(backend='nccl', rank=0, world_size=2)
+app = Flask(__name__)
+tensor_lock = threading.Lock()
+shared_tensor = None
 
-def run_target_model(target_model,
-                     gamma):
-    init_process()
-    # draft output: [1, prefix.len + gamma]
-    draft_output_shape = torch.empty((2),dtype=torch.long)
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
+target_model = AutoModelForCausalLM.from_pretrained("facebook/opt-1.3b",torch_dtype="auto", trust_remote_code=True)
+target_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-1.3b", trust_remote_code=True)
+target_model_cache = KVCacheModel(target_model, 1, 0, 0).to('cuda:0')
+    
+
+@torch.no_grad()
+def server_speculative_sampling(draft_tokens : torch.Tensor, 
+                        target_model_cache : torch.nn.Module, 
+                        temperature : float = 1, top_k : int = 0, 
+                        top_p : float = 0, verbose : bool = False, 
+                        random_seed : int = None) -> list  :
     
     
-    dist.recv(tensor=draft_output_shape, src=1)
-    print(f'server side: what is the draft_output_shape {draft_output_shape}')
-    draft_output = torch.empty((draft_output_shape[0],draft_output_shape[1]),dtype=torch.long)
+    draft_tokens = draft_tokens.to("cuda:0")
+    _ = target_model_cache.generate(draft_tokens,1)
+    target_model_history = target_model_cache._prob_history
+    target_model_history = target_model_history.to('cpu')
+    # shape_list = list(target_model_history.size())
+    return target_model_history.tolist()
 
-    dist.recv(tensor=draft_output,src =1)
-    print(f'server side: what is the draft_output {draft_output}')
+@app.route('/update_cache', methods=['POST'])
+def update_cache():
+    decision = None
+    rollback_num = request.get_json()
+    if rollback_num is not None:
+        target_model_cache.rollback(int(rollback_num['index']))
 
-    target_logits = target_model(draft_output).logits[:,-gamma-1:,:]
-    d1, d2, d3 = target_logits.shape
-    dist.send(tensor=torch.tensor((d1,d2,d3)),dst=1)
-    dist.send(tensor=target_logits,dst=1)
+    return jsonify({'message': f'target cache updated successfully {rollback_num}'})
 
-    # first receive the shape from weak machine 
-    # then assign the empty tensor with the shape
-    # second receive the draft_output from weak machine
-# run_target_model()
+@app.route('/send_tensor_to_server', methods=['POST'])
+def send_tensor():
+    global shared_tensor
+    data = request.get_json()
+    received_tensor = torch.tensor(data['tensor_list'])
+    
+    with tensor_lock:
+        shared_tensor = received_tensor
+    
+    return jsonify({'message': f'Tensor received by server successfully {received_tensor}'})
+
+@app.route('/get_tensor_from_server', methods=['GET'])
+def get_tensor():
+    global shared_tensor
+    with tensor_lock:
+        if shared_tensor is not None:
+            # clone_tensor = shared_tensor.clone().detach() ?
+            draft_tokens_tensor = torch.tensor(shared_tensor)
+            history = server_speculative_sampling(
+                draft_tokens=draft_tokens_tensor,
+                target_model_cache= target_model_cache,
+            )
+            tensor_to_send = history
+            shared_tensor = None
+            return jsonify({'tensor_list': tensor_to_send})
+        else:
+            return jsonify({'tensor_list': None})
+
+# if __name__ == '__main__':
+#     app.run(host='0.0.0.0', port=5000)
+
 if __name__ == "__main__":
-    target_model = "facebook/opt-1.3b"
-    draft_model = "facebook/opt-125m"
-
-    t_model = AutoModelForCausalLM.from_pretrained(target_model)
-    t_tokenizer = AutoTokenizer.from_pretrained(target_model)
-    t_model.cuda()
-    t_model.eval()
-    run_target_model(t_model,gamma=4)
+    
+    
+    
+    # ipp = '192.168.0.146'
+    # '192.168.0.239'
+    ips = "192.168.0.239"
+    # init_processes(0,2,'0.0.0.0',"1234")
+    # print("connected")
+    app.run(host=ips,port='6100')
