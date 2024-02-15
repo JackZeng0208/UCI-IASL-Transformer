@@ -7,7 +7,11 @@ from heterogeneous_utils import KVCacheModel,sample,norm_logits
 
 app = Flask(__name__)
 tensor_lock = threading.Lock()
-shared_tensor = None
+# shared_tensor = None
+
+draft_tokens = None
+past_kv = None
+given_prob = None
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -42,8 +46,11 @@ def new_server_speculative_sampling_with_kvCache(draft_tokens : torch.Tensor,
         """
         need given probability hist
         """
+        # past_kv and given_prob_history should both be none or not none
         _prob_history = given_prob_history.to('cuda:0')
-        past_kv = past_kv.to('cuda:0')
+
+        # past_kv need to device when received it 
+        past_kv = past_kv
         assert _prob_history != None, "_prob_history shouldn't be None"
         cached_len = 0
         for kv in past_kv:
@@ -66,10 +73,19 @@ def new_server_speculative_sampling_with_kvCache(draft_tokens : torch.Tensor,
         
         _past_key_values = outputs.past_key_values
     _prob_history = _prob_history.to('cpu')
-    _past_key_values = _past_key_values.to('cpu')
+    ## _past_key_values is a tuple with 12 tensor to sure the keys values, each tensor store key and value 
+    ## each k or v is size torch.Size([1, 12, 11, 64])
+    past_key_values_list = []
+    for kv in _past_key_values:
+        k, v = kv
+        k = k.to('cpu').tolist()
+        v = v.to('cpu').tolist()
+        past_key_values_list.append((k,v))
+    _prob_history = _prob_history.to('cpu')
+    # _past_key_values = _past_key_values.to('cpu')
 
     return {'prob_history':_prob_history.tolist(),
-            'past_key_values':_past_key_values.tolist()}
+            'past_key_values':past_key_values_list}
 ###########################
 # @torch.no_grad()
 # def server_speculative_sampling(draft_tokens : torch.Tensor, 
@@ -109,8 +125,21 @@ def send_tensor():
     data = request.get_json()
     # received_draft_tokens = torch.tensor(data['tensor_list'])
     received_draft_tokens = torch.tensor(data['draft_tokens'])
-    received_past_kv = torch.tensor(data['past_kv'])
-    received_given_prob = torch.tensor(data['update_prob'])
+    if data['past_kv'] and data['update_prob']:
+        processed_kv_list = []
+        # need extra carefull about the past_kv
+        for kv in data['past_kv']:
+            k,v = kv
+            k = torch.tensor(k,dtype=torch.float16)
+            k = k.to('cuda:0')
+            v = torch.tensor(v,dtype=torch.float16)
+            v = v.to('cuda:0')
+            processed_kv_list.append((k,v))
+        received_past_kv = processed_kv_list
+        received_given_prob = torch.tensor(data['update_prob'])
+    else:
+        received_past_kv = None
+        received_given_prob = None
     with tensor_lock:
         draft_tokens = received_draft_tokens
         past_kv = received_past_kv
@@ -133,10 +162,18 @@ def get_tensor():
         if draft_tokens is not None:
             # clone_tensor = shared_tensor.clone().detach() ?
             draft_tokens_tensor = torch.tensor(draft_tokens)
+
+            # def new_server_speculative_sampling_with_kvCache(draft_tokens : torch.Tensor, 
+            #                         past_kv: torch.Tensor,
+            #                         given_prob_history,
+            #             model : torch.nn.Module,temperature : float = 1, top_k : int = 0, 
+            #             top_p : float = 0, verbose : bool = False, 
+            #             random_seed : int = None):
             server_sampling_dict = new_server_speculative_sampling_with_kvCache(
                 draft_tokens=draft_tokens_tensor,
-                target_model_cache= past_kv,
-                given_prob_history=given_prob
+                past_kv= past_kv,
+                given_prob_history=given_prob,
+                model = target_model
             )
             draft_tokens = None
             past_kv = None
@@ -151,12 +188,8 @@ if __name__ == "__main__":
     input_ids = target_tokenizer.encode("Please write an introduction about UC Irvine: ", return_tensors='pt')
     input_ids = input_ids.to("cuda:0")
     _ =target_model(input_ids)
-    # _  = target_model_cache.generate(input_ids,1)
-    
-    
-    # ipp = '192.168.0.146'
-    # '192.168.0.239'
-    ips = "192.168.0.239"
+    # ips = "192.168.0.239"
+    IP = '0.0.0.0'
     # init_processes(0,2,'0.0.0.0',"1234")
-    # print("connected")
-    app.run(host=ips,port='6100')
+
+    app.run(host=IP,port=5000)

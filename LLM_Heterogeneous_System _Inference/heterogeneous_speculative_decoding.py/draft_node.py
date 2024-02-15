@@ -46,12 +46,12 @@ def edge_speculative_sampling(prefix : torch.Tensor,
         # update prefix len, it will update during each iteration
         prefix_len = prefix.shape[1]
         draft_tokens = approx_model_cache.generate(prefix, gamma)
-        draft_tokens_to_server = draft_tokens.to('cpu')
-        draft_token_list = draft_tokens_to_server.tolist()
+        # draft_tokens_to_server = draft_tokens.to('cpu')
+        # draft_token_list = draft_tokens_to_server.tolist()
         
         #target_model_history and target_past_kv will be only None for the first time communicate to server
         send_tensor_to_server(SERVER_IP=SERVER_IP,
-                              draft_tokens=draft_token_list,
+                              draft_tokens=draft_tokens,
                               update_prob=target_model_history,
                               past_kv=target_past_kv)
         
@@ -69,11 +69,13 @@ def edge_speculative_sampling(prefix : torch.Tensor,
             print(f'wating................. nothing received from server')
             received_dict = get_tensor(SERVER_IP=SERVER_IP)
         
-        target_model_history = received_dict['target_prob_hist']
-        target_past_kv = received_dict['target_past_kv']
+        target_model_history = received_dict['prob_history']
+        target_past_kv = received_dict['past_kv']
 
         target_model_history = target_model_history.to('cuda:0')
-        target_past_kv = target_past_kv.to('cuda:0')
+        
+        # don't need put the past kv on edge to device it is a list
+        target_past_kv = target_past_kv
 
         # n for rollback endposition
         n = prefix_len + gamma - 1
@@ -138,7 +140,10 @@ def edge_speculative_sampling(prefix : torch.Tensor,
     print(f"Acceptance Rate: {accepted_count/max_len}")
     return prefix
 
+import numpy as np
 def rollback(past_kv,prob_hist,end_pos:int):
+    
+    # print(f'type of end_pos {type(end_pos)}, content of end_pos {end_pos}')
     past_key_values_trimmed = []
     for kv in past_kv:
         k, v = kv
@@ -146,6 +151,8 @@ def rollback(past_kv,prob_hist,end_pos:int):
         # For example llama k, v should be (batch, num_head, seq_len, hidden_dim)
         
         # k, v (batch, head, seq, hidden_dim)
+        # assert type(end_pos) ==int, 'end post must be int'
+        
         k = k[:, :, :end_pos, :]
         v = v[:, :, :end_pos, :]
         kv_trimmed = (k, v)
@@ -160,7 +167,7 @@ def rollback(past_kv,prob_hist,end_pos:int):
 # def update_target_cache(SERVER_IP,port,index):
 #     data = {'index': index}
 #     response = requests.post(f'http://{SERVER_IP}:{port}/update_cache', json=data)
-PORT = '5000'
+PORT = 5000
 def send_tensor_to_server(SERVER_IP,
                           draft_tokens,
                           past_kv,
@@ -168,8 +175,20 @@ def send_tensor_to_server(SERVER_IP,
                           port = PORT):
     """
     correspond to send_tensor() function in server
+    need make past_kv and update_prob to list
     """
-    data = {'draft_tokens': draft_tokens,
+    # handle kv
+    if past_kv !=None: 
+        past_key_values_list = []
+        for kv in past_kv:
+            k, v = kv
+            k = k.tolist()
+            v = v.tolist()
+            past_key_values_list.append((k,v))
+        past_kv = past_key_values_list
+        update_prob = update_prob.to('cpu').tolist()
+
+    data = {'draft_tokens': draft_tokens.to('cpu').tolist(),
             'past_kv':past_kv,
             'update_prob':update_prob}
     response = requests.post(f'http://{SERVER_IP}:{port}/send_tensor_to_server', json=data)
@@ -189,14 +208,24 @@ def get_tensor(SERVER_IP,port=PORT):
         target_model_cache_history = torch.tensor(target_prob_hist)
         print(f'cache_history from target is {target_model_cache_history.shape}')
         if target_past_kv is not None: 
-            target_past_kv_tensor = torch.tensor(target_past_kv)
+            # it may not be necessary to make kv to tensor in edge device
+            # target_past_kv_tensor = torch.tensor(target_past_kv)
+            processed_kv_list = []
+            # need extra carefull about the past_kv
+            for kv in target_past_kv:
+                k,v = kv
+                k = torch.tensor(k)
+                v = torch.tensor(v)
+                processed_kv_list.append((k,v))
+            target_past_kv_tensor = processed_kv_list
         return {'prob_history':target_model_cache_history,
                 'past_kv':target_past_kv_tensor}#(target_model_cache_history,target_past_kv)
     else:
         return None
 
 if __name__ == '__main__':
-    SERVER_IP = '192.168.0.239'
+    # SERVER_IP = '192.168.0.239'
+    SERVER_IP = '192.168.0.132'
     approx_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m", torch_dtype="auto", trust_remote_code=True)
     approx_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
     input_ids = approx_tokenizer.encode("Please write an introduction about UC Irvine: ", return_tensors='pt')
