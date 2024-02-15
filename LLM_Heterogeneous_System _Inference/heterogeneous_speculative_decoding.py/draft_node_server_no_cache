@@ -50,23 +50,16 @@ def edge_speculative_sampling(prefix : torch.Tensor,
         
         #/get_tensor_from_server
         #get the logits
-        received_dict = get_tensor(SERVER_IP=SERVER_IP)
+        target_model_history = get_tensor(SERVER_IP=SERVER_IP)
 
         #############
         # how to wait until I get new tensor? 
         # I json error from get_tensor
         #############
-        while received_dict is None: 
-            print(f'wating................. nothing received from server')
-            received_dict = get_tensor(SERVER_IP=SERVER_IP)
         
-        target_model_history = received_dict['prob_history']
-        target_past_kv = received_dict['past_kv']
-
         target_model_history = target_model_history.to('cuda:0')
         
         # don't need put the past kv on edge to device it is a list
-        target_past_kv = target_past_kv
 
         # n for rollback endposition
         n = prefix_len + gamma - 1
