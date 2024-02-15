@@ -8,8 +8,10 @@ import torch
 import requests
 import torch
 import time
-from utilis import KVCacheModel, sample, max_fn
+from heterogeneous_utils import KVCacheModel, sample, max_fn
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
 
 def edge_speculative_sampling(prefix : torch.Tensor, 
                          approx_model : torch.nn.Module, 
@@ -35,72 +37,98 @@ def edge_speculative_sampling(prefix : torch.Tensor,
     start_time = time.time()
     #### stats collection ########
 
+    ## variables need send to server for kv_cache: 
+    target_past_kv = None
+    target_model_history = None 
+
     ## prefix = shape (1,prefix.len)
     while prefix.shape[1] < T: 
         # update prefix len, it will update during each iteration
         prefix_len = prefix.shape[1]
         draft_tokens = approx_model_cache.generate(prefix, gamma)
         draft_tokens_to_server = draft_tokens.to('cpu')
-        # draft_token_shape = list(draft_tokens.size())
         draft_token_list = draft_tokens_to_server.tolist()
-        send_tensor_to_server(SERVER_IP=SERVER_IP,tensor_list=draft_token_list)
-        received_tensor = get_tensor(SERVER_IP=SERVER_IP)
+        
+        #target_model_history and target_past_kv will be only None for the first time communicate to server
+        send_tensor_to_server(SERVER_IP=SERVER_IP,
+                              draft_tokens=draft_token_list,
+                              update_prob=target_model_history,
+                              past_kv=target_past_kv)
+        
+        #/get_tensor_from_server
+        # get the 
+            # 1. prob_history for comparison 
+            # 2. past_kv for rollback in edge side
+        received_dict = get_tensor(SERVER_IP=SERVER_IP)
+
         #############
         # how to wait until I get new tensor? 
         # I json error from get_tensor
         #############
-        while received_tensor is None: 
-            received_tensor = get_tensor(SERVER_IP=SERVER_IP)
+        while received_dict is None: 
+            print(f'wating................. nothing received from server')
+            received_dict = get_tensor(SERVER_IP=SERVER_IP)
         
-        target_model_history = received_tensor
-        target_model_history = target_model_history.to('cuda:0')
-        n = prefix_len + gamma - 1
-        
+        target_model_history = received_dict['target_prob_hist']
+        target_past_kv = received_dict['target_past_kv']
 
+        target_model_history = target_model_history.to('cuda:0')
+        target_past_kv = target_past_kv.to('cuda:0')
+
+        # n for rollback endposition
+        n = prefix_len + gamma - 1
         for i in range(gamma):
-            if random_seed:
-                torch.manual_seed(random_seed)
+            # if random_seed:
+            #     torch.manual_seed(random_seed)
             r = torch.rand(1, device = 'cuda:0')
             j = draft_tokens[:, prefix_len + i]
-            # j = j.to('cpu')
             
             if r > (target_model_history[:, prefix_len + i - 1, j]) / (approx_model_cache._prob_history[:, prefix_len + i - 1, j]):
                 # reject
                 n = prefix_len + i - 1
-                break
-            
-            # if verbose:
-            #     print(f"approx guess accepted {j[0]}: \033[31m{AutoTokenizer.decode(torch.tensor([j]))}\033[0m")
-
+                break  
             accepted_count += 1
         
         # print(f"n : {n}, i : {i}, prefix_len + gamma - 1: {prefix_len + gamma - 1}")
         assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
         prefix = draft_tokens[:, :n + 1]
-        
         approx_model_cache.rollback(n+1)
-        
         assert approx_model_cache._prob_history.shape[-2] <= n + 1, f"approx_model prob list shape {approx_model_cache._prob_history.shape}, n {n}"
         
         if n < prefix_len + gamma - 1:
-            # reject someone, sample from the pos n
+            """
+            reject someone, sample from the pos n
+            """
             t = sample(max_fn(target_model_history[:, n, :] - approx_model_cache._prob_history[:, n, :]))
-            # if verbose:
-            #     print(f"target resamples at position {n}: \033[34m{tokenizer.decode(t)}\033[0m")
             resample_count += 1
-            update_target_cache(SERVER_IP,n+1)
+
+            # update_target_cache(SERVER_IP,n+1)
+            # doing the roll back on edge device
+            rollback_dict = rollback(past_kv=target_past_kv,
+                                     prob_hist=target_model_history,
+                                     end_pos=n+1)
+            # update kv and prob 
+            target_past_kv = rollback_dict['past_kv']
+            target_model_history = rollback_dict['prob_hist']
+
             # target_model_cache.rollback(n+1)
         else:
-            # all approx model decoding accepted
+            """
+            all approx model decoding accepted
+            """
             assert n == target_model_history.shape[1] - 1
             t = sample(target_model_history[:, -1, :])
-            # if verbose:
-            #     print(f"target samples {n}: \033[35m{tokenizer.decode(t)}\033[0m")
             target_sample_count += 1
-            update_target_cache(SERVER_IP,n+2)
-            # target_model_cache.rollback(n+2)
+
+            # update_target_cache(SERVER_IP,n+2)
+            rollback_dict = rollback(past_kv=target_past_kv,
+                                     prob_hist=target_model_history,
+                                     end_pos=n+1)
+            # update kv and prob 
+            target_past_kv = rollback_dict['past_kv']
+            target_model_history = rollback_dict['prob_hist']
+        
         prefix = prefix.to("cuda:0")
-#         print(f'prefix device is {prefix.device}, t device is {t.device}')
         prefix = torch.cat((prefix, t), dim=1)
 
     if verbose:
@@ -110,26 +138,60 @@ def edge_speculative_sampling(prefix : torch.Tensor,
     print(f"Acceptance Rate: {accepted_count/max_len}")
     return prefix
 
-
+def rollback(past_kv,prob_hist,end_pos:int):
+    past_key_values_trimmed = []
+    for kv in past_kv:
+        k, v = kv
+        # NOTE() the indexing is specific for bloom. This won't work for other models
+        # For example llama k, v should be (batch, num_head, seq_len, hidden_dim)
+        
+        # k, v (batch, head, seq, hidden_dim)
+        k = k[:, :, :end_pos, :]
+        v = v[:, :, :end_pos, :]
+        kv_trimmed = (k, v)
+        past_key_values_trimmed.append(kv_trimmed)
+    past_kv = past_key_values_trimmed
+    prob_hist = prob_hist[:, :end_pos, :]
+    # self._prob_history = self._prob_history[:, :end_pos, :]
+    return {'past_kv':past_kv,'prob_hist':prob_hist}
 
 ###############################################################################
 # Replace with the actual IP address of the server
-def update_target_cache(SERVER_IP,index):
-    data = {'index': index}
-    response = requests.post(f'http://{SERVER_IP}:6100/update_cache', json=data)
-
-def send_tensor_to_server(SERVER_IP, tensor_list):
-    data = {'tensor_list': tensor_list}
-    response = requests.post(f'http://{SERVER_IP}:6100/send_tensor_to_server', json=data)
+# def update_target_cache(SERVER_IP,port,index):
+#     data = {'index': index}
+#     response = requests.post(f'http://{SERVER_IP}:{port}/update_cache', json=data)
+PORT = '5000'
+def send_tensor_to_server(SERVER_IP,
+                          draft_tokens,
+                          past_kv,
+                          update_prob,
+                          port = PORT):
+    """
+    correspond to send_tensor() function in server
+    """
+    data = {'draft_tokens': draft_tokens,
+            'past_kv':past_kv,
+            'update_prob':update_prob}
+    response = requests.post(f'http://{SERVER_IP}:{port}/send_tensor_to_server', json=data)
     print('send from edge to server',response.json())
 
-def get_tensor(SERVER_IP):
-    response = requests.get(f'http://{SERVER_IP}:6100/get_tensor_from_server')
-    tensor_data = response.json()['tensor_list']
-    if tensor_data is not None:
-        target_model_cache_history = torch.tensor(tensor_data)
+def get_tensor(SERVER_IP,port=PORT):
+    """
+    correspond to get_tensor() function in server
+    return 
+    1. tensored prob history 
+    2. tensored target_kv 
+    """
+    response = requests.get(f'http://{SERVER_IP}:{port}/get_tensor_from_server')
+    target_prob_hist = response.json()['target_prob_hist']
+    target_past_kv = response.json()['target_past_kv']
+    if target_prob_hist is not None:
+        target_model_cache_history = torch.tensor(target_prob_hist)
         print(f'cache_history from target is {target_model_cache_history.shape}')
-        return target_model_cache_history
+        if target_past_kv is not None: 
+            target_past_kv_tensor = torch.tensor(target_past_kv)
+        return {'prob_history':target_model_cache_history,
+                'past_kv':target_past_kv_tensor}#(target_model_cache_history,target_past_kv)
     else:
         return None
 
@@ -142,12 +204,13 @@ if __name__ == '__main__':
     # inputs = target_tokenizer("Please write an introduction about UC Irvine: ", return_tensors="pt", return_attention_mask=False)
     top_k = 20
     top_p = 0.9
-    edge_speculative_sampling(
+    output = edge_speculative_sampling(
         prefix=input_ids,
         approx_model=approx_model,
         SERVER_IP= SERVER_IP,
         max_len=10,
         gamma=4,
     )
+    print(f'output is {approx_tokenizer.batch_decode(output)}')
   
 
