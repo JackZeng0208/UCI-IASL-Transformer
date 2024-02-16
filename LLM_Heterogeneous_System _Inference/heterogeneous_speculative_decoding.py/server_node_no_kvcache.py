@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify
 import torch
 import threading
 from heterogeneous_utils import KVCacheModel,sample,norm_logits
+import time
 
 app = Flask(__name__)
 tensor_lock = threading.Lock()
@@ -20,6 +21,15 @@ target_model.to('cuda:0')
 @torch.no_grad()
 ########################### new server_speculatie sampling 
 
+# class stats:
+#     def __init__(self):
+#         self.time_spend_sending_message = 0
+#         self.time_spend_serialize_tensor = 0
+#         self.time_spend_make_tensor_to_list = 0
+#         self.time_spend_on_target_model = 0 
+        
+
+# heterogeneous_stats = stats()
 ###########################
 @torch.no_grad()
 def server_speculative_sampling_without_kvcache(draft_tokens : torch.Tensor, 
@@ -29,13 +39,13 @@ def server_speculative_sampling_without_kvcache(draft_tokens : torch.Tensor,
                         random_seed : int = None) -> list  :
     
     
-    draft_tokens = draft_tokens.to("cuda:0")
+    
     target_model_history = model(draft_tokens).logits
     for i in range(target_model_history.shape[-2]):
         target_model_history[:,i,:] = norm_logits(target_model_history[:,i,:],temperature,top_k,top_p)
-    target_model_history = target_model_history.to('cpu')
+    
     # shape_list = list(target_model_history.size())
-    return target_model_history.tolist()
+    return target_model_history
 
 
 @app.route('/send_tensor_to_server', methods=['POST'])
@@ -66,15 +76,29 @@ def get_tensor():
     with tensor_lock:
         if draft_tokens is not None:
             # clone_tensor = shared_tensor.clone().detach() ?
+            list_to_tensor_time = time.time()
             draft_tokens_tensor = torch.tensor(draft_tokens)
-            target_model_history_list = server_speculative_sampling_without_kvcache(
-                draft_tokens=draft_tokens_tensor,
+            draft_tokens = draft_tokens_tensor.to("cuda:0")
+            finish_list_to_tensor_time = time.time()
+
+            target_forward_time = time.time()
+            target_model_history_tensor = server_speculative_sampling_without_kvcache(
+                draft_tokens=draft_tokens,
                 model= target_model
             )
-            
+            finish_target_forward_time = time.time()
+
+            tensor_to_list_time = time.time()
+            target_model_history = target_model_history_tensor.to('cpu')
+            model_history_list = target_model_history.tolist()
+            finish_tensor_to_list_time = time.time()
+
             draft_tokens = None
             # return jsonify({'tensor_list': tensor_to_send})
-            return jsonify({'target_prob_hist': target_model_history_list})
+            return jsonify({'target_prob_hist': model_history_list,
+                            'tensor_to_list_time':finish_tensor_to_list_time - tensor_to_list_time,
+                            'target_model_generation_time':finish_target_forward_time-target_forward_time,
+                            'list_to_tensor_time': finish_list_to_tensor_time -list_to_tensor_time })
         else:
             return jsonify({'target_prob_hist': None})
 

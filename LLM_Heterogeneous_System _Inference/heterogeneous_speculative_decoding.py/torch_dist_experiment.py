@@ -1,46 +1,56 @@
+"""run.py:"""
+#!/usr/bin/env python
 import os
-import torch.distributed as dist
-# from torch.multiprocessing import Process
-from  time import sleep
-import datetime
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-def init_processes(rank, size,IP, Port ,backend='nccl'):
-    """ Initialize the distributed environment. """    
-    print('{} : started process for rank : {}'.format(os.getpid(),rank))
-	
-    # os.environ['MASTER_ADDR'] = "66.42.104.193"
-    # os.environ['MASTER_PORT'] = '6100'
-	#Remove init_method if initializing through environment variable
-    dist.init_process_group(backend = backend, 
-                            init_method=f'tcp://{IP}:{Port}',
-                            rank=rank,
-                            world_size=size,
-                            timeout=datetime.timedelta(1,seconds =  20))
-def double_send(rank):
-    if rank == 0: # server
-        draft_output_shape = torch.empty((2),dtype=torch.long,device='cuda:0')
-        req = dist.recv(tensor=draft_output_shape,src=1)
-        # req.wait()
-        print(f"draft_output_shape from src 1 should be [1,1] is {draft_output_shape}")
-        # draft_output = torch.empty((draft_output_shape[0],draft_output_shape[1]),dtype=torch.long)
-        # req = dist.irecv(tensor=draft_output,src =1)
-        # req.wait()
-    if rank ==1: # edge
-        shape = torch.tensor([1,1])
-        req = dist.send(tensor=shape,dst=0)
-        # req.wait()
+def run(rank, size):
+    tensor = torch.zeros(1)
+    req = None
+    if rank == 0:
+        tensor += 1
+        # Send the tensor to process 1
+        req = dist.isend(tensor=tensor, dst=1)
+        print('Rank 0 started sending')
+    else:
+        # Receive tensor from process 0
+        req = dist.irecv(tensor=tensor, src=0)
+        print('Rank 1 started receiving')
+    req.wait()
+    print('Rank ', rank, ' has data ', tensor[0])
+
+def init_process(rank, size, fn, backend='gloo'):
+    """ Initialize the distributed environment. """
+    os.environ['MASTER_ADDR'] = '192.168.0.132'
+    os.environ['MASTER_PORT'] = '5000'
+    dist.init_process_group(backend, rank=rank, world_size=size)
+    fn(rank, size)
+
+
 if __name__ == "__main__":
-    print(dist.is_available())
-    print(dist.is_nccl_available()) 
-    # SERVER_IP = '0.0.0.0'
-    EDGE_IP = '192.168.0.208'
-    SERVER_IP = '192.168.0.132' 
-    Port = "5000"
-    init_processes(rank=0,
-                   size=2,
-                   IP=SERVER_IP,
-                   Port=Port)
-    print('connect to edge')
-    double_send(0)
+    size = 2
+    processes = []
+    mp.set_start_method("spawn")
+    for rank in range(size):
+        p = mp.Process(target=init_process, args=(rank, size, run))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+# if __name__ == "__main__":
+#     os.environ["0NCCL_AVOID_RECORD_STREAMS"] = "0"
+#     print(dist.is_available())
+#     print(dist.is_nccl_available()) 
+#     # SERVER_IP = '0.0.0.0'
+#     EDGE_IP = '192.168.0.208'
+#     SERVER_IP = '192.168.0.132' 
+#     Port = "5000"
+#     init_processes(rank=0,
+#                    size=2,
+#                    IP=SERVER_IP,
+#                    Port=Port)
+#     print('connect to edge')
+#     double_send(0)
         
