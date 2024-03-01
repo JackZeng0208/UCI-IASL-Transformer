@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 
 dist.init_process_group(backend='nccl',
-                        init_method='tcp://<服务器IP>:<端口>',
+                        init_method='tcp://192.168.0.132:1234',
                         world_size=2,
                         rank=1)
 
