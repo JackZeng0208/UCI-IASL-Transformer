@@ -1,13 +1,38 @@
+import zmq
 import torch
-import torch.distributed as dist
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM
+def dtype_mapping(torch_dtype):
+    """Map a PyTorch dtype to the equivalent NumPy dtype."""
+    mapping = {
+        'torch.float32': np.float32,
+        'torch.float64': np.float64,
+        'torch.float16': np.float16,
+        'torch.uint8': np.uint8,
+        'torch.int8': np.int8,
+        'torch.int16': np.int16,
+        'torch.int32': np.int32,
+        'torch.int64': np.int64,
+    }
+    return mapping.get(str(torch_dtype), np.float32) 
 
-dist.init_process_group(backend='nccl',
-                        init_method='tcp://192.168.0.132:1234',
-                        world_size=2,
-                        rank=1)
+def receive_tensor(port=1919):
+    context = zmq.Context()
+    socket = context.socket(zmq.PULL)  # PULL socket
+    socket.connect(f"tcp://192.168.0.132:{port}")  # Connect to server
 
-received_logits = torch.zeros(10, 100)
-dist.recv(tensor=received_logits, src=0)
+    metadata = socket.recv_pyobj()
+    payload = socket.recv()
+    # print(metadata)
+    # print(payload)
+    np_dtype = dtype_mapping(metadata['dtype'])
+    tensor = np.frombuffer(payload, dtype=np_dtype).reshape(metadata['shape'])
+    tensor = torch.from_numpy(tensor)  # Convert NumPy array back to PyTorch tensor
 
-print("Edge side: received logits from server")
-print("Received logits:\n", received_logits)
+    socket.close()
+    context.term()
+
+    return tensor
+
+tensor = receive_tensor()
+print(tensor)

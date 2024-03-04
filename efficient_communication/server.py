@@ -1,15 +1,30 @@
+import zmq
 import torch
-import torch.distributed as dist
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-dist.init_process_group(backend='nccl',
-                        init_method='tcp://192.168.0.132:1234',
-                        world_size=2,
-                        rank=0)
 
-# Example logits
-logits = torch.randn(10, 100)
+def send_tensor(tensor, port=1919):
+    context = zmq.Context()
+    socket = context.socket(zmq.PUSH)  # PUSH socket
+    socket.bind(f"tcp://*:{port}")  # Bind to the given port
 
-dist.barrier()
-dist.send(tensor=logits, dst=1)
+    payload = tensor.numpy().tobytes()
 
-print("Message has been sent successfully")
+    # Send tensor shape and dtype as well (needed for reconstruction)
+    metadata = {
+        'dtype': str(tensor.dtype),
+        'shape': tensor.size()
+    }
+
+    # Send metadata and payload
+    socket.send_pyobj(metadata)
+    socket.send(payload)
+
+    socket.close()
+    context.term()
+
+# Example tensor to send
+tensor = torch.randn(2, 2)  # Example tensor
+print(tensor)
+send_tensor(tensor)
