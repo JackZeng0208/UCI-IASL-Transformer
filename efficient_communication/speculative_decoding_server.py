@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist 
 import torch
 import threading
-from heterogeneous_utils import KVCacheModel, sample, norm_logits
+from heterogeneous_utils import norm_logits
 import time
 import zmq
 
@@ -32,7 +32,7 @@ def handle_request(socket):
     while True:
         message = socket.recv_pyobj()
         if message['type'] == 'send_tensor':
-            received_draft_tokens = torch.tensor(message['draft_tokens'])
+            received_draft_tokens = message['draft_tokens']
             with tensor_lock:
                 draft_tokens = received_draft_tokens
             socket.send_pyobj({'message': 'server received tokens'})
