@@ -39,11 +39,7 @@ def handle_request(socket):
         elif message['type'] == 'get_tensor':
             with tensor_lock:
                 if draft_tokens is not None:
-                    list_to_tensor_time = time.time()
-                    draft_tokens_tensor = torch.tensor(draft_tokens)
-                    draft_tokens = draft_tokens_tensor.to("cuda:0")
-                    finish_list_to_tensor_time = time.time()
-
+                    draft_tokens = draft_tokens.to("cuda:0")
                     target_forward_time = time.time()
                     target_model_history_tensor = server_speculative_sampling_without_kvcache(
                         draft_tokens=draft_tokens,
@@ -51,17 +47,11 @@ def handle_request(socket):
                     )
                     finish_target_forward_time = time.time()
 
-                    tensor_to_list_time = time.time()
-                    # target_model_history = target_model_history_tensor.to('cpu')
-                    # model_history_list = target_model_history.tolist()
-                    finish_tensor_to_list_time = time.time()
 
                     draft_tokens = None
                     response = {
                         'target_prob_hist': target_model_history_tensor,
-                        'tensor_to_list_time': finish_tensor_to_list_time - tensor_to_list_time,
                         'target_model_generation_time': finish_target_forward_time - target_forward_time,
-                        'list_to_tensor_time': finish_list_to_tensor_time - list_to_tensor_time
                     }
                 else:
                     response = {'target_prob_hist': None}
