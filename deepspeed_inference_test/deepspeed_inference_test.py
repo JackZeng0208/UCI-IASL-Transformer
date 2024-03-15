@@ -15,7 +15,7 @@ token_generation_speed = []
 for _ in tqdm(range(100)):
     with torch.no_grad():
         start_time = time.time()
-        generated_ids = model.generate(input_ids, do_sample = True, max_length = 500)
+        generated_ids = model.generate(input_ids, do_sample = True, max_length = 500, use_cache=True)
         end_time = time.time()
         token_generation_speed.append(len(generated_ids[0]) / (end_time - start_time))
 print(f"Average token generation speed: {np.average(token_generation_speed)} tokens/s (Without DeepSpeed)")
