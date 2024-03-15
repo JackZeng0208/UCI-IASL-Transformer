@@ -7,8 +7,6 @@ import zmq
 class stats:
     def __init__(self):
         self.time_spend_sending_message = 0
-        self.time_spend_tensor_to_list = 0
-        self.time_spend_list_to_tensor = 0
         self.time_spend_on_draft_model_generation = 0
         self.time_spend_on_target_model_forward = 0
 
@@ -42,13 +40,9 @@ def edge_speculative_sampling(prefix: torch.Tensor,
         draft_generate_end_time = time.time()
         heterogeneous_stats.time_spend_on_draft_model_generation += draft_generate_end_time - draft_generate_start_time
 
-        tensor_to_list_time = time.time()
-        draft_tokens_list = draft_tokens.to('cpu').tolist()
-        finish_tensor_to_list_time = time.time()
-        heterogeneous_stats.time_spend_tensor_to_list += finish_tensor_to_list_time - tensor_to_list_time
 
         send_tensor_start_time = time.time()
-        socket.send_pyobj({'type': 'send_tensor', 'draft_tokens': draft_tokens_list})
+        socket.send_pyobj({'type': 'send_tensor', 'draft_tokens': draft_tokens})
         response = socket.recv_pyobj()
         print('send from edge to server', response)
 
@@ -57,20 +51,12 @@ def edge_speculative_sampling(prefix: torch.Tensor,
         send_tensor_end_time = time.time()
 
         target_model_history = target_model_mesg_dict['target_prob_hist']
-        tensor_to_list_time = target_model_mesg_dict['tensor_to_list_time']
         target_model_generation_time = target_model_mesg_dict['target_model_generation_time']
-        list_to_tensor_time = target_model_mesg_dict['list_to_tensor_time']
-        total_time_in_server = tensor_to_list_time + target_model_generation_time + list_to_tensor_time
+        total_time_in_server = target_model_generation_time
         heterogeneous_stats.time_spend_sending_message += send_tensor_end_time - send_tensor_start_time - total_time_in_server
         heterogeneous_stats.time_spend_on_target_model_forward += target_model_generation_time
-        heterogeneous_stats.time_spend_list_to_tensor += list_to_tensor_time
-        heterogeneous_stats.time_spend_tensor_to_list += tensor_to_list_time
 
-        create_tensor_time = time.time()
-        target_model_history = torch.tensor(target_model_history)
         target_model_history = target_model_history.to('cuda:0')
-        finish_create_tensor_time = time.time()
-        heterogeneous_stats.time_spend_list_to_tensor += finish_create_tensor_time - create_tensor_time
 
         n = prefix_len + gamma - 1
         for i in range(gamma):
@@ -121,8 +107,6 @@ if __name__ == '__main__':
         gamma=4,
     )
     print(f'total time on communication: {heterogeneous_stats.time_spend_sending_message}')
-    print(f'total time on list to tensor (tensor() + to(cuda:0)): {heterogeneous_stats.time_spend_list_to_tensor}')
-    print(f'total time on tensor to list (to cpu() + tolist()): {heterogeneous_stats.time_spend_tensor_to_list}')
     print(f'total time on target model forward: {heterogeneous_stats.time_spend_on_target_model_forward}')
     print(f'total time on draft model generation: {heterogeneous_stats.time_spend_on_draft_model_generation}')
     print(f'output is {approx_tokenizer.batch_decode(output)}')
