@@ -32,7 +32,7 @@ def edge_speculative_sampling(prefix: torch.Tensor,
 
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
-    socket.connect(f"tcp://{SERVER_IP}:5555")
+    socket.connect(f"tcp://{SERVER_IP}:1919")
 
     while prefix.shape[1] < T:
         prefix_len = prefix.shape[1]
